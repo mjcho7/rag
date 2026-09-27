@@ -69,7 +69,7 @@ def load_documents(data_dir: Path) -> list[Document]:
 
 
 @st.cache_resource(show_spinner="DATA 문서를 읽고 검색 인덱스를 만드는 중입니다...")
-def build_vector_store() -> InMemoryVectorStore:
+def build_vector_store() -> tuple[InMemoryVectorStore, list[Document]]:
     """문서를 적당한 크기로 나눈 후 OpenAI 임베딩으로 메모리 벡터DB를 만듭니다."""
     if not DATA_DIR.exists():
         raise FileNotFoundError(f"DATA 폴더를 찾을 수 없습니다: {DATA_DIR}")
@@ -79,13 +79,18 @@ def build_vector_store() -> InMemoryVectorStore:
         raise ValueError("DATA 폴더에서 읽을 수 있는 문서를 찾지 못했습니다.")
 
     # 문장 경계를 우선 보존하면서, 긴 문서를 검색하기 좋은 크기로 나눕니다.
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1_000, chunk_overlap=150)
-    chunks = splitter.split_documents(documents)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+    chunks: list[Document] = []
+    for document in documents:
+        # 같은 페이지에서 앞뒤 조각을 함께 찾을 수 있도록 순번을 기록합니다.
+        for chunk_index, chunk in enumerate(splitter.split_documents([document])):
+            chunk.metadata["chunk_index"] = chunk_index
+            chunks.append(chunk)
 
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     vector_store = InMemoryVectorStore(embedding=embeddings)
     vector_store.add_documents(chunks)
-    return vector_store
+    return vector_store, chunks
 
 
 def evidence_sentence(text: str, question: str) -> str:
@@ -113,9 +118,41 @@ def format_context(documents: list[Document]) -> str:
     return "\n\n".join(parts)
 
 
-def answer_question(question: str, vector_store: InMemoryVectorStore) -> tuple[str, list[Document]]:
+def add_neighbor_chunks(
+    retrieved_documents: list[Document], all_chunks: list[Document]
+) -> list[Document]:
+    """검색된 조각의 앞뒤 조각도 보태 Q&A의 질문과 답변이 분리되지 않게 합니다."""
+    selected: list[Document] = []
+    selected_keys: set[tuple[str, int | None, int]] = set()
+
+    for document in retrieved_documents:
+        source = str(document.metadata.get("source"))
+        page = document.metadata.get("page")
+        chunk_index = int(document.metadata.get("chunk_index", 0))
+
+        for candidate in all_chunks:
+            candidate_source = str(candidate.metadata.get("source"))
+            candidate_page = candidate.metadata.get("page")
+            candidate_index = int(candidate.metadata.get("chunk_index", 0))
+            is_neighbor = (
+                candidate_source == source
+                and candidate_page == page
+                and abs(candidate_index - chunk_index) <= 1
+            )
+            key = (candidate_source, candidate_page, candidate_index)
+            if is_neighbor and key not in selected_keys:
+                selected.append(candidate)
+                selected_keys.add(key)
+
+    return selected
+
+
+def answer_question(
+    question: str, vector_store: InMemoryVectorStore, all_chunks: list[Document]
+) -> tuple[str, list[Document]]:
     """최신 메시지 API로 검색 결과를 근거로만 답변합니다."""
-    documents = vector_store.similarity_search(question, k=4)
+    retrieved_documents = vector_store.similarity_search(question, k=6)
+    documents = add_neighbor_chunks(retrieved_documents, all_chunks)
     context = format_context(documents)
     system_prompt = """당신은 제공된 문서 근거만으로 답하는 RAG 도우미입니다.
 문서에 답이 없거나 근거가 부족하면 반드시 '제공된 문서에서 확인할 수 없습니다.'라고 답하세요.
@@ -148,7 +185,7 @@ def main() -> None:
     os.environ["OPENAI_API_KEY"] = api_key
 
     try:
-        vector_store = build_vector_store()
+        vector_store, all_chunks = build_vector_store()
     except Exception as error:
         st.error(f"문서 검색 인덱스를 만들지 못했습니다: {error}")
         st.stop()
@@ -172,7 +209,7 @@ def main() -> None:
 
     with st.chat_message("assistant"):
         with st.spinner("문서에서 근거를 찾는 중입니다..."):
-            answer, sources = answer_question(question, vector_store)
+            answer, sources = answer_question(question, vector_store, all_chunks)
         st.markdown(answer)
         show_sources(sources, question)
 

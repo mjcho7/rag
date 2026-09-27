@@ -22,6 +22,22 @@ DATA_DIR = PROJECT_DIR / "DATA"
 SUPPORTED_SUFFIXES = {".pdf", ".txt", ".md", ".csv", ".json"}
 
 
+def get_openai_api_key() -> str | None:
+    """로컬 .env 또는 Streamlit Cloud Secrets에서 OpenAI 키를 읽습니다."""
+    # 로컬 개발 환경에서는 .env 파일을 사용합니다.
+    load_dotenv(PROJECT_DIR / ".env")
+    local_key = os.getenv("OPENAI_API_KEY")
+    if local_key:
+        return local_key
+
+    # Streamlit Cloud에서는 Secrets에 저장한 값을 직접 읽습니다.
+    try:
+        return st.secrets.get("OPENAI_API_KEY")
+    except FileNotFoundError:
+        # 로컬에 secrets.toml 파일이 없는 경우에도 앱이 정상적으로 안내를 표시합니다.
+        return None
+
+
 def load_documents(data_dir: Path) -> list[Document]:
     """DATA 폴더의 지원 파일을 읽고 파일명·페이지 정보를 함께 저장합니다."""
     documents: list[Document] = []
@@ -118,16 +134,18 @@ def answer_question(question: str, vector_store: InMemoryVectorStore) -> tuple[s
 
 def main() -> None:
     """Streamlit 화면을 구성합니다."""
-    load_dotenv(PROJECT_DIR / ".env")
-
     st.set_page_config(page_title="공무원 여비 RAG 챗봇", page_icon="📚")
     st.title("📚 공무원 여비 RAG 챗봇")
     st.caption("DATA 폴더 문서를 검색해, 확인 가능한 내용만 답변합니다.")
 
-    if not os.getenv("OPENAI_API_KEY"):
-        st.error(".env 파일에 OPENAI_API_KEY를 설정한 뒤 다시 실행하세요.")
-        st.code("OPENAI_API_KEY=sk-...", language="bash")
+    api_key = get_openai_api_key()
+    if not api_key:
+        st.error("OpenAI API 키를 설정한 뒤 다시 실행하세요.")
+        st.code('OPENAI_API_KEY = "sk-..."', language="toml")
         st.stop()
+
+    # LangChain OpenAI 클라이언트가 동일한 키를 사용하도록 환경 변수에도 설정합니다.
+    os.environ["OPENAI_API_KEY"] = api_key
 
     try:
         vector_store = build_vector_store()
